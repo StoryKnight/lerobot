@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,6 +42,14 @@ from .pipeline import (
     RobotProcessorPipeline,
 )
 from .rename_processor import RenameObservationsProcessorStep
+
+logger = logging.getLogger(__name__)
+
+# Teleoperators that emit end-effector / stick deltas rather than joint targets.
+DELTA_TELEOP_TYPES = {"gamepad", "keyboard_ee"}
+
+# Joint-space followers that can consume `{motor}.pos` actions directly.
+JOINT_SPACE_ROBOT_TYPES = {"so100_follower", "so101_follower"}
 
 
 def make_default_teleop_action_processor() -> RobotProcessorPipeline[
@@ -74,8 +83,51 @@ def make_default_robot_observation_processor() -> RobotProcessorPipeline[RobotOb
     return robot_observation_processor
 
 
-def make_default_processors():
+def make_default_processors(
+    teleop_config: object | None = None,
+    robot_config: object | None = None,
+) -> tuple[
+    RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    RobotProcessorPipeline[tuple[RobotAction, RobotObservation], RobotAction],
+    RobotProcessorPipeline[RobotObservation, RobotObservation],
+]:
+    """Build the processor pipelines for a teleop + robot combination.
+
+    When a delta teleop (gamepad, keyboard_ee) is paired with a joint-space
+    robot (so100/so101_follower), the teleop action processor maps stick
+    deltas onto joint positions. Otherwise identity processors are returned.
+
+    Args:
+        teleop_config: Teleoperator configuration with a ``.type`` attribute.
+            When *None*, identity processors are returned.
+        robot_config: Robot configuration with a ``.type`` attribute.
+            When *None*, identity processors are returned.
+    """
     teleop_action_processor = make_default_teleop_action_processor()
+
+    if teleop_config is not None and robot_config is not None:
+        teleop_type = getattr(teleop_config, "type", None)
+        robot_type = getattr(robot_config, "type", None)
+
+        if teleop_type in DELTA_TELEOP_TYPES and robot_type in JOINT_SPACE_ROBOT_TYPES:
+            from lerobot.processor.delta_action_processor import (
+                SO_FOLLOWER_MOTOR_NAMES,
+                MapDeltaActionToJointPositionsStep,
+            )
+
+            logger.info(
+                "Building direct joint-control pipeline (%s deltas -> %s joint positions)",
+                teleop_type,
+                robot_type,
+            )
+            teleop_action_processor = RobotProcessorPipeline[
+                tuple[RobotAction, RobotObservation], RobotAction
+            ](
+                steps=[MapDeltaActionToJointPositionsStep(motor_names=list(SO_FOLLOWER_MOTOR_NAMES))],
+                to_transition=robot_action_observation_to_transition,
+                to_output=transition_to_robot_action,
+            )
+
     robot_action_processor = make_default_robot_action_processor()
     robot_observation_processor = make_default_robot_observation_processor()
     return (teleop_action_processor, robot_action_processor, robot_observation_processor)

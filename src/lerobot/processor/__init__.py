@@ -38,7 +38,12 @@ from .converters import (
     transition_to_policy_action,
     transition_to_robot_action,
 )
-from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
+from .delta_action_processor import (
+    MapDeltaActionToJointPositionsStep,
+    MapDeltaActionToRobotActionStep,
+    MapTensorToDeltaActionDictStep,
+    SO_FOLLOWER_MOTOR_NAMES,
+)
 from .device_processor import DeviceProcessorStep
 from .env_processor import IsaaclabArenaProcessorStep, LiberoProcessorStep
 from .factory import (
@@ -143,8 +148,10 @@ __all__ = [
     "make_policy_processor_pipelines",
     "AbsoluteActionsProcessorStep",
     "RelativeActionsProcessorStep",
+    "MapDeltaActionToJointPositionsStep",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
+    "SO_FOLLOWER_MOTOR_NAMES",
     "NewLineTaskProcessorStep",
     "NormalizerProcessorStep",
     "Numpy2TorchActionProcessorStep",

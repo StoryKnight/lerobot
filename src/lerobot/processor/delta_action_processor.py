@@ -14,12 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
-from lerobot.lerobot_types import PolicyAction, RobotAction
+from lerobot.lerobot_types import PolicyAction, RobotAction, TransitionKey
 
 from .pipeline import ActionProcessorStep, ProcessorStepRegistry, RobotActionProcessorStep
+
+# Motor names for SO-100 / SO-101 (order matches the follower bus).
+SO_FOLLOWER_MOTOR_NAMES = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
 
 
 @ProcessorStepRegistry.register("map_tensor_to_delta_action_dict")
@@ -97,23 +107,18 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
         delta_x = action.pop("delta_x")
         delta_y = action.pop("delta_y")
         delta_z = action.pop("delta_z")
+        delta_wz = action.pop("delta_wz", 0.0)
         gripper = action.pop("gripper")
 
         # Determine if the teleoperator is actively providing input
-        # Consider enabled if any significant movement delta is detected
-        position_magnitude = (delta_x**2 + delta_y**2 + delta_z**2) ** 0.5  # Use Euclidean norm for position
-        enabled = position_magnitude > self.noise_threshold  # Small threshold to avoid noise
+        # Consider enabled if any significant movement or rotation delta is detected
+        position_magnitude = (delta_x**2 + delta_y**2 + delta_z**2) ** 0.5
+        enabled = position_magnitude > self.noise_threshold or abs(delta_wz) > self.noise_threshold
 
         # Scale the deltas appropriately
         scaled_delta_x = delta_x * self.position_scale
         scaled_delta_y = delta_y * self.position_scale
         scaled_delta_z = delta_z * self.position_scale
-
-        # For gamepad/keyboard, we don't have rotation input, so set to 0
-        # These could be extended in the future for more sophisticated teleoperators
-        target_wx = 0.0
-        target_wy = 0.0
-        target_wz = 0.0
 
         # Update action with robot target format
         action = {
@@ -121,9 +126,9 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
             "target_x": scaled_delta_x,
             "target_y": scaled_delta_y,
             "target_z": scaled_delta_z,
-            "target_wx": target_wx,
-            "target_wy": target_wy,
-            "target_wz": target_wz,
+            "target_wx": 0.0,
+            "target_wy": 0.0,
+            "target_wz": float(delta_wz),
             "gripper_vel": float(gripper),
         }
 
@@ -147,6 +152,87 @@ class MapDeltaActionToRobotActionStep(RobotActionProcessorStep):
             "gripper_vel",
         ]:
             features[PipelineFeatureType.ACTION][f"{feat}"] = PolicyFeature(
+                type=FeatureType.ACTION, shape=(1,)
+            )
+
+        return features
+
+
+@ProcessorStepRegistry.register("map_delta_action_to_joint_positions")
+@dataclass
+class MapDeltaActionToJointPositionsStep(RobotActionProcessorStep):
+    """
+    Maps delta teleop actions (gamepad / keyboard_ee) to joint position targets.
+
+    Each incoming axis is applied as a per-frame increment on the matching joint,
+    using the current robot observation as the reference. This avoids inverse
+    kinematics and extra dependencies when driving an SO-100 / SO-101 follower.
+
+    Axis mapping:
+        delta_x  (left stick Y)  → shoulder_lift
+        delta_y  (left stick X)  → shoulder_pan
+        delta_z  (right stick Y) → elbow_flex
+        delta_wx (right stick X) → wrist_flex
+        delta_wz (L1/R1)         → wrist_roll
+        gripper  (L2/R2)         → gripper (0=close, 1=stay, 2=open)
+    """
+
+    motor_names: list[str] = field(default_factory=lambda: list(SO_FOLLOWER_MOTOR_NAMES))
+    joint_step_size: float = 3.0
+    gripper_step_size: float = 5.0
+
+    def action(self, action: RobotAction) -> RobotAction:
+        raw_observation = self.transition.get(TransitionKey.OBSERVATION)
+        if raw_observation is None:
+            raise ValueError(
+                "Robot observation is required to map delta teleop actions to joint positions."
+            )
+        observation = raw_observation.copy()
+
+        delta_shoulder_pan = float(action.pop("delta_y", 0.0))
+        delta_shoulder_lift = float(action.pop("delta_x", 0.0))
+        delta_elbow_flex = float(action.pop("delta_z", 0.0))
+        delta_wrist_flex = float(action.pop("delta_wx", 0.0))
+        delta_wrist_roll = float(action.pop("delta_wz", 0.0))
+        gripper = float(action.pop("gripper", 1.0))
+
+        joint_deltas = {
+            "shoulder_pan": delta_shoulder_pan,
+            "shoulder_lift": delta_shoulder_lift,
+            "elbow_flex": delta_elbow_flex,
+            "wrist_flex": delta_wrist_flex,
+            "wrist_roll": delta_wrist_roll,
+        }
+
+        result: RobotAction = {}
+        for name in self.motor_names:
+            key = f"{name}.pos"
+            if key not in observation:
+                raise ValueError(
+                    f"Observation missing '{key}' required to map delta teleop to joint positions."
+                )
+            current_pos = float(observation[key])
+            if name == "gripper":
+                # GripperAction: CLOSE=0, STAY=1, OPEN=2. SO gripper range is 0 (closed) to 100 (open).
+                if gripper == 0:
+                    result[key] = max(current_pos - self.gripper_step_size, 0.0)
+                elif gripper == 2:
+                    result[key] = min(current_pos + self.gripper_step_size, 100.0)
+                else:
+                    result[key] = current_pos
+            else:
+                result[key] = current_pos + joint_deltas.get(name, 0.0) * self.joint_step_size
+
+        return result
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        for key in ["delta_x", "delta_y", "delta_z", "delta_wx", "delta_wz", "gripper"]:
+            features[PipelineFeatureType.ACTION].pop(key, None)
+
+        for name in self.motor_names:
+            features[PipelineFeatureType.ACTION][f"{name}.pos"] = PolicyFeature(
                 type=FeatureType.ACTION, shape=(1,)
             )
 

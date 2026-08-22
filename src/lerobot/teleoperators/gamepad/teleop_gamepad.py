@@ -19,8 +19,6 @@ import sys
 from enum import IntEnum
 from typing import Any
 
-import numpy as np
-
 from lerobot.lerobot_types import RobotAction
 from lerobot.utils.decorators import check_if_not_connected
 
@@ -68,18 +66,19 @@ class GamepadTeleop(Teleoperator):
 
     @property
     def action_features(self) -> dict:
+        names = {"delta_x": 0, "delta_y": 1, "delta_z": 2, "delta_wx": 3, "delta_wz": 4}
         if self.config.use_gripper:
+            names["gripper"] = 5
             return {
                 "dtype": "float32",
-                "shape": (4,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2, "gripper": 3},
+                "shape": (6,),
+                "names": names,
             }
-        else:
-            return {
-                "dtype": "float32",
-                "shape": (3,),
-                "names": {"delta_x": 0, "delta_y": 1, "delta_z": 2},
-            }
+        return {
+            "dtype": "float32",
+            "shape": (5,),
+            "names": names,
+        }
 
     @property
     def feedback_features(self) -> dict:
@@ -91,8 +90,13 @@ class GamepadTeleop(Teleoperator):
         else:
             from .gamepad_utils import GamepadController as Gamepad
 
-        self.gamepad = Gamepad()
+        self.gamepad = Gamepad(device_name=self.config.device_name)
         self.gamepad.start()
+        if not self.gamepad.running:
+            raise RuntimeError(
+                "Gamepad failed to start. Connect a controller and retry, or pass "
+                "--teleop.device_name= to select one (for example 'dualsense' or 'ps5')."
+            )
 
     @check_if_not_connected
     def get_action(self) -> RobotAction:
@@ -102,13 +106,12 @@ class GamepadTeleop(Teleoperator):
         # Get movement deltas from the controller
         delta_x, delta_y, delta_z = self.gamepad.get_deltas()
 
-        # Create action from gamepad input
-        gamepad_action = np.array([delta_x, delta_y, delta_z], dtype=np.float32)
-
         action_dict = {
-            "delta_x": gamepad_action[0],
-            "delta_y": gamepad_action[1],
-            "delta_z": gamepad_action[2],
+            "delta_x": float(delta_x),
+            "delta_y": float(delta_y),
+            "delta_z": float(delta_z),
+            "delta_wx": float(self.gamepad.right_x),
+            "delta_wz": float(self.gamepad.wrist_roll_command),
         }
 
         # Default gripper action is to stay

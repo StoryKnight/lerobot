@@ -25,3 +25,6 @@ class GamepadTeleopConfig(TeleoperatorConfig):
     use_gripper: bool = True
     # Use hidapi instead of pygame for controllers that pygame cannot detect reliably.
     hidapi_fallback: bool = False
+    # Substring matched against the device product/manufacturer name (or vid:pid).
+    # When None, the first recognized gamepad is used.
+    device_name: str | None = None

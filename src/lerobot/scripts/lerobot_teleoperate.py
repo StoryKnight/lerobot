@@ -47,6 +47,19 @@ lerobot-teleoperate \
     --display_mode=foxglove
 ```
 
+Example gamepad teleoperation of an SO-101 (PS5 DualSense, Xbox, or any SDL/HID pad):
+
+```shell
+lerobot-teleoperate \
+    --robot.type=so101_follower \
+    --robot.port=COM3 \
+    --robot.id=my_follower \
+    --teleop.type=gamepad
+```
+
+If several controllers are connected, select one with ``--teleop.device_name=dualsense``.
+On macOS, if sticks do not move the arm, add ``--teleop.hidapi_fallback=true``.
+
 Example teleoperation with bimanual so100:
 
 ```shell
@@ -265,7 +278,9 @@ def teleoperate(cfg: TeleoperateConfig):
 
     teleop = make_teleoperator_from_config(cfg.teleop)
     robot = make_robot_from_config(cfg.robot)
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors(
+        cfg.teleop, cfg.robot
+    )
 
     teleop.connect()
     robot.connect()
