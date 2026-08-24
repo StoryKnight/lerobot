@@ -11,6 +11,7 @@ from lerobot.teleoperators.gamepad.gamepad_utils import (
     XBOX_JOYSTICK_LAYOUT,
     InputController,
     apply_deadzone,
+    boost_weak_stick_axis,
     classify_hid_report,
     hid_device_is_gamepad,
     infer_dualsense_analog_layout,
@@ -97,6 +98,18 @@ class TestInferDualsenseAnalogLayout:
 
     def test_too_few_axes(self):
         assert infer_dualsense_analog_layout([0.0, 0.0, 0.0]) is None
+
+
+class TestBoostWeakStickAxis:
+    def test_boosts_compressed_right_y(self):
+        boosted = boost_weak_stick_axis(0.08, peak=0.08, reference_peak=0.95)
+        assert boosted == pytest.approx(0.95)
+
+    def test_does_not_boost_healthy_axis(self):
+        assert boost_weak_stick_axis(0.9, peak=0.9, reference_peak=0.95) == pytest.approx(0.9)
+
+    def test_does_not_boost_without_reference(self):
+        assert boost_weak_stick_axis(0.08, peak=0.08, reference_peak=0.1) == pytest.approx(0.08)
 
 
 class TestApplyDeadzone:

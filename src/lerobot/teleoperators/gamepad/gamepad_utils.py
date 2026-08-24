@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import struct
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from lerobot.utils.import_utils import _hidapi_available, _pygame_available, require_package
@@ -180,6 +180,17 @@ def infer_dualsense_analog_layout(rest_axes: list[float]) -> JoystickLayout | No
     if abs(a2) < 0.3 and abs(a3) < 0.3 and abs(a4) > 0.5:
         return DUALSENSE_JOYSTICK_LAYOUT
     return None
+
+
+def boost_weak_stick_axis(raw: float, peak: float, reference_peak: float, max_gain: float = 20.0) -> float:
+    """Stretch a compressed stick axis so its peak matches a healthy reference axis.
+
+    Some DualSense/evdev paths report right-stick Y with only ~0.05–0.15 throw
+    while X uses the full -1..1 range. Without this, elbow_flex barely creeps.
+    """
+    if reference_peak >= 0.35 and 0.02 <= peak <= 0.45 and peak > 0:
+        return raw * min(reference_peak / peak, max_gain)
+    return raw
 
 
 def _u8_axis(value: int) -> float:
@@ -646,6 +657,8 @@ class GamepadController(InputController):
         self._sdl_module = None
         self._layout = XBOX_JOYSTICK_LAYOUT
         self._analog_from_joystick = False
+        self._stick_peaks = {"left_x": 0.0, "left_y": 0.0, "right_x": 0.0, "right_y": 0.0}
+        self._ry_gain_logged = False
         self.intervention_flag = False
 
     def start(self):
@@ -675,6 +688,14 @@ class GamepadController(InputController):
         inferred = infer_dualsense_analog_layout(rest) if self._analog_from_joystick else None
         if inferred is not None:
             self._layout = inferred
+
+        logger.info(
+            "Joystick caps: axes=%s buttons=%s hats=%s rest=%s",
+            self.joystick.get_numaxes(),
+            self.joystick.get_numbuttons(),
+            self.joystick.get_numhats(),
+            [round(v, 3) for v in rest],
+        )
 
         if (
             self._sdl_module is not None
@@ -750,6 +771,62 @@ class GamepadController(InputController):
             self._update_from_sdl()
         elif self.joystick is not None:
             self._update_from_joystick()
+
+    def _track_stick_peak(self, name: str, raw: float) -> float:
+        mag = abs(raw)
+        if mag > self._stick_peaks[name]:
+            self._stick_peaks[name] = mag
+        if name != "right_y":
+            return raw
+        ref = max(self._stick_peaks.values())
+        peak = self._stick_peaks[name]
+        boosted = boost_weak_stick_axis(raw, peak, ref)
+        if boosted != raw and not self._ry_gain_logged:
+            gain = (ref / peak) if peak else 1.0
+            logger.warning(
+                "Right stick Y (elbow_flex) only reaches %.3f vs other sticks %.3f; "
+                "applying %.1fx gain so elbow_flex matches wrist_flex throw.",
+                peak,
+                ref,
+                min(gain, 20.0),
+            )
+            self._ry_gain_logged = True
+        return boosted
+
+    def _read_right_y(self) -> float:
+        """Read right-stick Y, stealing a stronger unused axis if one appears."""
+        layout = self._layout
+        primary = self._safe_axis(layout.right_y)
+        if self.joystick is None:
+            return primary
+
+        assigned = {
+            layout.left_x,
+            layout.left_y,
+            layout.right_x,
+            layout.trigger_left,
+            layout.trigger_right,
+        }
+        assigned.discard(None)
+        best_idx = layout.right_y
+        best_val = primary
+        for i in range(self.joystick.get_numaxes()):
+            if i in assigned or i == layout.right_y:
+                continue
+            value = self._safe_axis(i)
+            if abs(abs(value) - 1.0) < 0.05:
+                continue
+            if abs(value) > abs(best_val) + 0.25:
+                best_idx, best_val = i, value
+        if best_idx != layout.right_y and abs(best_val) > 0.4:
+            logger.info(
+                "Remapping right stick Y (elbow_flex) from axis %s to axis %s",
+                layout.right_y,
+                best_idx,
+            )
+            self._layout = replace(layout, right_y=best_idx)
+            return best_val
+        return primary
 
     def _safe_axis(self, index: int | None) -> float:
         if index is None or self.joystick is None or index >= self.joystick.get_numaxes():
@@ -828,10 +905,10 @@ class GamepadController(InputController):
 
     def _update_from_joystick(self):
         layout = self._layout
-        left_x = self._safe_axis(layout.left_x)
-        left_y = self._safe_axis(layout.left_y)
-        right_x = self._safe_axis(layout.right_x)
-        right_y = self._safe_axis(layout.right_y)
+        left_x = self._track_stick_peak("left_x", self._safe_axis(layout.left_x))
+        left_y = self._track_stick_peak("left_y", self._safe_axis(layout.left_y))
+        right_x = self._track_stick_peak("right_x", self._safe_axis(layout.right_x))
+        right_y = self._track_stick_peak("right_y", self._read_right_y())
         trigger_left = self._trigger_from_axis_or_button(layout.trigger_left, layout.button_l1)
         trigger_right = self._trigger_from_axis_or_button(layout.trigger_right, layout.button_r1)
         # Some pads expose L2/R2 only as buttons (indices often 6/7) when analog axes are missing.
