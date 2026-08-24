@@ -6,12 +6,14 @@ import pytest
 
 from lerobot.teleoperators.gamepad.gamepad_utils import (
     DUALSENSE_JOYSTICK_LAYOUT,
+    LINUX_DUALSENSE_JOYSTICK_LAYOUT,
     SONY_VENDOR_ID,
     XBOX_JOYSTICK_LAYOUT,
     InputController,
     apply_deadzone,
     classify_hid_report,
     hid_device_is_gamepad,
+    infer_dualsense_analog_layout,
     layout_for_device_name,
     parse_logitech_report,
     parse_sony_hid_report,
@@ -57,18 +59,44 @@ class TestInputController:
 
 
 class TestLayoutForDeviceName:
-    def test_dualsense_names(self):
+    def test_dualsense_linux_uses_axis_4_for_right_y(self):
         for name in (
             "DualSense Wireless Controller",
             "PS5 Controller",
-            "Sony Interactive Entertainment Wireless Controller",
+            "Sony Interactive Entertainment DualSense Wireless Controller",
             "Wireless Controller",
         ):
-            assert layout_for_device_name(name) is DUALSENSE_JOYSTICK_LAYOUT
+            layout = layout_for_device_name(name, platform="linux")
+            assert layout is LINUX_DUALSENSE_JOYSTICK_LAYOUT
+            assert layout.right_y == 4
+            assert layout.right_x == 3
+            assert layout.trigger_left == 2
+
+    def test_dualsense_windows_uses_axis_3_for_right_y(self):
+        layout = layout_for_device_name("DualSense Wireless Controller", platform="win32")
+        assert layout is DUALSENSE_JOYSTICK_LAYOUT
+        assert layout.right_y == 3
+        assert layout.right_x == 2
 
     def test_xbox_names(self):
         for name in ("Xbox One Controller", "Xbox 360 Controller", "Generic USB Joystick"):
-            assert layout_for_device_name(name) is XBOX_JOYSTICK_LAYOUT
+            assert layout_for_device_name(name, platform="linux") is XBOX_JOYSTICK_LAYOUT
+
+
+class TestInferDualsenseAnalogLayout:
+    def test_linux_rest_positions(self):
+        # LX, LY, L2, RX, RY, R2
+        layout = infer_dualsense_analog_layout([0.0, 0.0, -1.0, 0.0, 0.0, -1.0])
+        assert layout is LINUX_DUALSENSE_JOYSTICK_LAYOUT
+        assert layout.right_y == 4
+
+    def test_windows_rest_positions(self):
+        layout = infer_dualsense_analog_layout([0.0, 0.0, 0.0, 0.0, -1.0, -1.0])
+        assert layout is DUALSENSE_JOYSTICK_LAYOUT
+        assert layout.right_y == 3
+
+    def test_too_few_axes(self):
+        assert infer_dualsense_analog_layout([0.0, 0.0, 0.0]) is None
 
 
 class TestApplyDeadzone:

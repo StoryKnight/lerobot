@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import struct
+import sys
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,7 @@ class JoystickLayout:
 
 # DualSense / DualShock over Windows DirectInput (pygame.joystick, not XInput).
 # Face buttons are Square, Cross, Circle, Triangle — not Xbox A/B/X/Y order.
+# Analog: LX, LY, RX, RY, L2, R2.
 DUALSENSE_JOYSTICK_LAYOUT = JoystickLayout(
     left_x=0,
     left_y=1,
@@ -103,8 +105,36 @@ DUALSENSE_JOYSTICK_LAYOUT = JoystickLayout(
     button_r1=5,
 )
 
+# DualSense on Linux hid-playstation. evdev ABS_* numeric order is
+# X, Y, Z(L2), RX, RY, RZ(R2) — so right-stick Y is axis 4, not 3.
+# Buttons follow the kernel Xbox-style map (Cross=A, Circle=B, …).
+LINUX_DUALSENSE_JOYSTICK_LAYOUT = JoystickLayout(
+    left_x=0,
+    left_y=1,
+    right_x=3,
+    right_y=4,
+    trigger_left=2,
+    trigger_right=5,
+    button_south=0,
+    button_east=1,
+    button_west=2,
+    button_north=3,
+    button_l1=4,
+    button_r1=5,
+)
+
 # Xbox / XInput and SDL GameController-style numbering.
 XBOX_JOYSTICK_LAYOUT = JoystickLayout()
+
+_SONY_NAME_TOKENS = (
+    "dualsense",
+    "dualshock",
+    "wireless controller",
+    "ps5",
+    "ps4",
+    "playstation",
+    "sony",
+)
 
 
 def apply_deadzone(value: float, deadzone: float) -> float:
@@ -119,21 +149,37 @@ def normalize_stick(raw: float, deadzone: float, *, invert_y: bool = False) -> f
     return apply_deadzone(value, deadzone)
 
 
-def layout_for_device_name(name: str) -> JoystickLayout:
-    """Pick a raw-joystick layout from the device product name."""
+def is_sony_gamepad_name(name: str) -> bool:
     lowered = name.lower()
-    sony_tokens = (
-        "dualsense",
-        "dualshock",
-        "wireless controller",
-        "ps5",
-        "ps4",
-        "playstation",
-        "sony",
-    )
-    if any(token in lowered for token in sony_tokens):
+    return any(token in lowered for token in _SONY_NAME_TOKENS)
+
+
+def layout_for_device_name(name: str, platform: str | None = None) -> JoystickLayout:
+    """Pick a raw-joystick layout from the device product name and OS."""
+    if not is_sony_gamepad_name(name):
+        return XBOX_JOYSTICK_LAYOUT
+    platform = platform or sys.platform
+    if platform.startswith("linux"):
+        return LINUX_DUALSENSE_JOYSTICK_LAYOUT
+    return DUALSENSE_JOYSTICK_LAYOUT
+
+
+def infer_dualsense_analog_layout(rest_axes: list[float]) -> JoystickLayout | None:
+    """Choose DualSense stick/trigger axes from values captured at rest.
+
+    Linux hid-playstation at rest is typically ``[0, 0, -1, 0, 0, -1]``
+    (L2/R2 on axes 2 and 5). Windows DirectInput is ``[0, 0, 0, 0, -1, -1]``.
+    """
+    if len(rest_axes) < 6:
+        return None
+    a2, a3, a4 = rest_axes[2], rest_axes[3], rest_axes[4]
+    # L2 parked near -1 and both right-stick axes near 0 → Linux evdev order.
+    if abs(a2) > 0.5 and abs(a3) < 0.3 and abs(a4) < 0.3:
+        return LINUX_DUALSENSE_JOYSTICK_LAYOUT
+    # Right stick on 2/3, L2 parked near -1 on axis 4 → Windows DirectInput.
+    if abs(a2) < 0.3 and abs(a3) < 0.3 and abs(a4) > 0.5:
         return DUALSENSE_JOYSTICK_LAYOUT
-    return XBOX_JOYSTICK_LAYOUT
+    return None
 
 
 def _u8_axis(value: int) -> float:
@@ -599,6 +645,7 @@ class GamepadController(InputController):
         self._sdl_controller = None
         self._sdl_module = None
         self._layout = XBOX_JOYSTICK_LAYOUT
+        self._analog_from_joystick = False
         self.intervention_flag = False
 
     def start(self):
@@ -619,6 +666,15 @@ class GamepadController(InputController):
         self.joystick.init()
         name = self.joystick.get_name()
         self._layout = layout_for_device_name(name)
+        # DualSense SDL community mappings on Linux often bind righty to axis 3
+        # (right stick X / ABS_RX). Read analog axes from the raw joystick instead.
+        self._analog_from_joystick = is_sony_gamepad_name(name)
+
+        pygame.event.pump()
+        rest = [self.joystick.get_axis(i) for i in range(self.joystick.get_numaxes())]
+        inferred = infer_dualsense_analog_layout(rest) if self._analog_from_joystick else None
+        if inferred is not None:
+            self._layout = inferred
 
         if (
             self._sdl_module is not None
@@ -629,6 +685,17 @@ class GamepadController(InputController):
             logger.info("Initialized gamepad via SDL GameController: %s", name)
         else:
             logger.info("Initialized gamepad via raw joystick: %s", name)
+
+        logger.info(
+            "Analog layout for %s: right_x=axis %s, right_y=axis %s (elbow_flex), "
+            "L2=axis %s, R2=axis %s%s",
+            name,
+            self._layout.right_x,
+            self._layout.right_y,
+            self._layout.trigger_left,
+            self._layout.trigger_right,
+            " (raw joystick axes; SDL buttons)" if self._analog_from_joystick else "",
+        )
 
         print(f"Gamepad: {name}")
         print("Gamepad controls:")
@@ -675,7 +742,11 @@ class GamepadController(InputController):
     def update(self):
         """Process pygame events and read the current pad state."""
         pygame.event.pump()
-        if self._sdl_controller is not None:
+        if self._analog_from_joystick and self.joystick is not None:
+            self._update_from_joystick()
+            if self._sdl_controller is not None:
+                self._overlay_sdl_buttons()
+        elif self._sdl_controller is not None:
             self._update_from_sdl()
         elif self.joystick is not None:
             self._update_from_joystick()
@@ -722,6 +793,38 @@ class GamepadController(InputController):
             ),
             self.deadzone,
         )
+
+    def _overlay_sdl_buttons(self):
+        """Replace face/shoulder buttons from SDL while keeping DualSense analog axes."""
+        module = self._sdl_module
+        ctrl = self._sdl_controller
+        if module is None or ctrl is None:
+            return
+        btn_a = getattr(module, "CONTROLLER_BUTTON_A", 0)
+        btn_x = getattr(module, "CONTROLLER_BUTTON_X", 2)
+        btn_y = getattr(module, "CONTROLLER_BUTTON_Y", 3)
+        btn_l1 = getattr(module, "CONTROLLER_BUTTON_LEFTSHOULDER", 9)
+        btn_r1 = getattr(module, "CONTROLLER_BUTTON_RIGHTSHOULDER", 10)
+        south = bool(ctrl.get_button(btn_a))
+        west = bool(ctrl.get_button(btn_x))
+        north = bool(ctrl.get_button(btn_y))
+        l1 = bool(ctrl.get_button(btn_l1))
+        r1 = bool(ctrl.get_button(btn_r1))
+        if l1 and not r1:
+            self.wrist_roll_command = -1.0
+        elif r1 and not l1:
+            self.wrist_roll_command = 1.0
+        else:
+            self.wrist_roll_command = 0.0
+        self.intervention_flag = r1
+        if north:
+            self.episode_end_status = TeleopEvents.SUCCESS
+        elif west:
+            self.episode_end_status = TeleopEvents.FAILURE
+        elif south:
+            self.episode_end_status = TeleopEvents.RERECORD_EPISODE
+        else:
+            self.episode_end_status = None
 
     def _update_from_joystick(self):
         layout = self._layout

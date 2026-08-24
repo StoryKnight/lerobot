@@ -217,6 +217,13 @@ class SOFollower(Robot):
         """
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
+        if not goal_pos:
+            raise ValueError(
+                "send_action received no joint targets (expected keys ending in '.pos'), "
+                f"got {sorted(action)}. Gamepad and keyboard_ee emit delta_x/y/z and need "
+                "MapDeltaActionToJointPositionsStep in the teleop processor pipeline. "
+                "Use a LeRobot checkout that wires make_default_processors(cfg.teleop, cfg.robot)."
+            )
 
         # Cap goal position when too far away from present position.
         # /!\ Slower fps expected due to reading from the follower.
