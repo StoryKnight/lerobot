@@ -17,9 +17,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import struct
 import sys
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from lerobot.utils.import_utils import _hidapi_available, _pygame_available, require_package
@@ -182,15 +184,150 @@ def infer_dualsense_analog_layout(rest_axes: list[float]) -> JoystickLayout | No
     return None
 
 
-def boost_weak_stick_axis(raw: float, peak: float, reference_peak: float, max_gain: float = 20.0) -> float:
-    """Stretch a compressed stick axis so its peak matches a healthy reference axis.
+def classify_joystick_axes(rest_axes: list[float]) -> tuple[list[int], list[int]]:
+    """Split pygame axes into stick-like (idle ~0) vs trigger-like (idle ~-1)."""
+    sticks: list[int] = []
+    triggers: list[int] = []
+    for index, value in enumerate(rest_axes):
+        if value < -0.5:
+            triggers.append(index)
+        else:
+            sticks.append(index)
+    return sticks, triggers
 
-    Some DualSense/evdev paths report right-stick Y with only ~0.05–0.15 throw
-    while X uses the full -1..1 range. Without this, elbow_flex barely creeps.
-    """
-    if reference_peak >= 0.35 and 0.02 <= peak <= 0.45 and peak > 0:
-        return raw * min(reference_peak / peak, max_gain)
-    return raw
+
+def duplicates_reference(value: float, reference: float, eps: float = 0.18) -> bool:
+    """True when `value` is the same (or inverted) copy of another stick axis."""
+    if abs(reference) < 0.25:
+        return False
+    return abs(value - reference) < eps or abs(value + reference) < eps
+
+
+def pick_strongest_uncorrelated(
+    candidates: list[tuple[str, float]], reference: float, min_abs: float
+) -> tuple[str, float]:
+    """Pick the largest candidate that is not a duplicate of `reference` (right stick X)."""
+    best_name, best_val = "", 0.0
+    for name, value in candidates:
+        if duplicates_reference(value, reference):
+            continue
+        if abs(value) > abs(best_val):
+            best_name, best_val = name, value
+    if abs(best_val) < min_abs:
+        return "", 0.0
+    return best_name, best_val
+
+
+# Linux joystick API (`linux/joystick.h`) — the same interface `jstest` uses.
+JS_EVENT_SIZE = 8
+JS_EVENT_FORMAT = "=IhBB"
+JS_EVENT_BUTTON = 0x01
+JS_EVENT_AXIS = 0x02
+JS_EVENT_INIT = 0x80
+_LINUX_JS_SKIP_TOKENS = ("motion", "sensor", "touchpad", "accelerometer", "gyro")
+
+
+def parse_js_event(data: bytes) -> tuple[int, int, float] | None:
+    """Decode one 8-byte ``js_event``. Axis values are normalized to [-1, 1]."""
+    if len(data) != JS_EVENT_SIZE:
+        return None
+    _time, value, ev_type, number = struct.unpack(JS_EVENT_FORMAT, data)
+    kind = ev_type & ~JS_EVENT_INIT
+    if kind == JS_EVENT_AXIS:
+        return kind, number, max(-1.0, min(1.0, value / 32767.0))
+    if kind == JS_EVENT_BUTTON:
+        return kind, number, 1.0 if value else 0.0
+    return None
+
+
+def is_linux_gamepad_js_name(name: str) -> bool:
+    """True for a gamepad js node, false for DualSense motion/touchpad extras."""
+    lowered = name.lower()
+    if any(token in lowered for token in _LINUX_JS_SKIP_TOKENS):
+        return False
+    return is_sony_gamepad_name(name) or any(
+        token in lowered for token in ("xbox", "x-box", "gamepad", "controller", "logitech")
+    )
+
+
+def list_linux_js_devices() -> list[tuple[str, str]]:
+    """Return ``(path, sysfs name)`` pairs for ``/dev/input/js*``."""
+    root = Path("/dev/input")
+    if not root.is_dir():
+        return []
+    found: list[tuple[str, str]] = []
+    for path in sorted(root.glob("js*")):
+        sys_js = Path("/sys/class/input") / path.name
+        name = path.name
+        for candidate in (sys_js / "device" / "name", sys_js / "device" / "device" / "name"):
+            try:
+                name = candidate.read_text(encoding="utf-8").strip()
+                break
+            except OSError:
+                continue
+        found.append((str(path), name))
+    return found
+
+
+def select_linux_js_device(
+    devices: list[tuple[str, str]],
+    *,
+    pygame_name: str,
+    device_name: str | None = None,
+) -> str | None:
+    """Pick the gamepad ``/dev/input/jsN``, skipping motion-sensor nodes."""
+    candidates = [(path, name) for path, name in devices if is_linux_gamepad_js_name(name)]
+    if not candidates:
+        return None
+    needle = (device_name or pygame_name).lower()
+    if needle:
+        for path, name in candidates:
+            if needle in name.lower():
+                return path
+    if is_sony_gamepad_name(pygame_name):
+        for path, name in candidates:
+            if is_sony_gamepad_name(name):
+                return path
+    return candidates[0][0]
+
+
+class LinuxJoystickReader:
+    """Non-blocking reader for ``/dev/input/js*`` (same protocol as ``jstest``)."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.axes: dict[int, float] = {}
+        self._fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        self.pump()
+
+    def pump(self) -> None:
+        while True:
+            try:
+                data = os.read(self._fd, JS_EVENT_SIZE)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+            parsed = parse_js_event(data)
+            if parsed is None:
+                return
+            kind, number, value = parsed
+            if kind == JS_EVENT_AXIS:
+                self.axes[number] = value
+
+    def axis(self, index: int | None) -> float:
+        if index is None:
+            return 0.0
+        return self.axes.get(index, 0.0)
+
+    def close(self) -> None:
+        fd = self._fd
+        self._fd = -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _u8_axis(value: int) -> float:
@@ -657,8 +794,11 @@ class GamepadController(InputController):
         self._sdl_module = None
         self._layout = XBOX_JOYSTICK_LAYOUT
         self._analog_from_joystick = False
-        self._stick_peaks = {"left_x": 0.0, "left_y": 0.0, "right_x": 0.0, "right_y": 0.0}
-        self._ry_gain_logged = False
+        self._stick_axis_indices: list[int] = []
+        self._trigger_axis_indices: list[int] = []
+        self._ry_source_logged = False
+        self._dumped_live_axes = False
+        self._linux_js: LinuxJoystickReader | None = None
         self.intervention_flag = False
 
     def start(self):
@@ -688,13 +828,16 @@ class GamepadController(InputController):
         inferred = infer_dualsense_analog_layout(rest) if self._analog_from_joystick else None
         if inferred is not None:
             self._layout = inferred
+        self._stick_axis_indices, self._trigger_axis_indices = classify_joystick_axes(rest)
 
         logger.info(
-            "Joystick caps: axes=%s buttons=%s hats=%s rest=%s",
+            "Joystick caps: axes=%s buttons=%s hats=%s rest=%s stick_axes=%s trigger_axes=%s",
             self.joystick.get_numaxes(),
             self.joystick.get_numbuttons(),
             self.joystick.get_numhats(),
             [round(v, 3) for v in rest],
+            self._stick_axis_indices,
+            self._trigger_axis_indices,
         )
 
         if (
@@ -717,6 +860,8 @@ class GamepadController(InputController):
             self._layout.trigger_right,
             " (raw joystick axes; SDL buttons)" if self._analog_from_joystick else "",
         )
+        if sys.platform.startswith("linux") and self._analog_from_joystick:
+            self._try_open_linux_js(name)
 
         print(f"Gamepad: {name}")
         print("Gamepad controls:")
@@ -746,8 +891,43 @@ class GamepadController(InputController):
             "Use --teleop.device_name= to select one."
         )
 
+    def _try_open_linux_js(self, pygame_name: str) -> None:
+        """Read DualSense analog axes from ``/dev/input/js*`` (same as ``jstest``).
+
+        pygame 2 uses SDL/evdev. On hid-playstation DualSense that path often
+        reports a ~0.07-range right-stick Y while ``jstest`` on the js node
+        shows a full ±1 throw. Amplifying pygame's weak axis does nothing.
+        """
+        path = select_linux_js_device(
+            list_linux_js_devices(),
+            pygame_name=pygame_name,
+            device_name=self.device_name,
+        )
+        if path is None:
+            logger.info("No Linux /dev/input/js* gamepad node found; using pygame axes.")
+            return
+        try:
+            self._linux_js = LinuxJoystickReader(path)
+        except OSError as exc:
+            logger.warning(
+                "Could not open %s (%s). elbow_flex will use pygame axes. "
+                "If jstest works, add your user to the 'input' group and re-login.",
+                path,
+                exc,
+            )
+            return
+        logger.info(
+            "Reading analog sticks from %s (Linux joystick API, same as jstest). "
+            "right_y=axis %s → elbow_flex",
+            path,
+            self._layout.right_y,
+        )
+
     def stop(self):
         """Clean up pygame resources."""
+        if self._linux_js is not None:
+            self._linux_js.close()
+            self._linux_js = None
         if self._sdl_controller is not None:
             try:
                 self._sdl_controller.quit()
@@ -763,6 +943,8 @@ class GamepadController(InputController):
     def update(self):
         """Process pygame events and read the current pad state."""
         pygame.event.pump()
+        if self._linux_js is not None:
+            self._linux_js.pump()
         if self._analog_from_joystick and self.joystick is not None:
             self._update_from_joystick()
             if self._sdl_controller is not None:
@@ -772,61 +954,67 @@ class GamepadController(InputController):
         elif self.joystick is not None:
             self._update_from_joystick()
 
-    def _track_stick_peak(self, name: str, raw: float) -> float:
-        mag = abs(raw)
-        if mag > self._stick_peaks[name]:
-            self._stick_peaks[name] = mag
-        if name != "right_y":
-            return raw
-        ref = max(self._stick_peaks.values())
-        peak = self._stick_peaks[name]
-        boosted = boost_weak_stick_axis(raw, peak, ref)
-        if boosted != raw and not self._ry_gain_logged:
-            gain = (ref / peak) if peak else 1.0
-            logger.warning(
-                "Right stick Y (elbow_flex) only reaches %.3f vs other sticks %.3f; "
-                "applying %.1fx gain so elbow_flex matches wrist_flex throw.",
-                peak,
-                ref,
-                min(gain, 20.0),
-            )
-            self._ry_gain_logged = True
-        return boosted
+    def _sdl_right_y(self) -> float:
+        if self._sdl_controller is None or self._sdl_module is None:
+            return 0.0
+        axis = getattr(self._sdl_module, "CONTROLLER_AXIS_RIGHTY", 3)
+        return float(self._sdl_controller.get_axis(axis)) / 32767.0
 
-    def _read_right_y(self) -> float:
-        """Read right-stick Y, stealing a stronger unused axis if one appears."""
+    def _resolve_right_y(self, right_x: float) -> float:
+        """Choose right-stick Y from every idle-centered axis plus SDL RIGHTY.
+
+        pygame's axis 4 is often *not* the full-range Ry that ``jstest`` shows.
+        Amplifying that weak channel does nothing; pick the axis that actually
+        throws to ±1 and is not a copy of right-stick X (wrist_flex).
+        """
         layout = self._layout
-        primary = self._safe_axis(layout.right_y)
-        if self.joystick is None:
-            return primary
+        reserved = {layout.left_x, layout.left_y, layout.right_x}
+        reserved.discard(None)
+        candidates: list[tuple[str, float]] = []
+        for index in self._stick_axis_indices:
+            if index in reserved:
+                continue
+            candidates.append((f"js{index}", self._safe_axis(index)))
+        default_name = f"js{layout.right_y}"
+        if not any(name == default_name for name, _ in candidates):
+            candidates.append((default_name, self._safe_axis(layout.right_y)))
 
-        assigned = {
-            layout.left_x,
-            layout.left_y,
-            layout.right_x,
-            layout.trigger_left,
-            layout.trigger_right,
-        }
-        assigned.discard(None)
-        best_idx = layout.right_y
-        best_val = primary
-        for i in range(self.joystick.get_numaxes()):
-            if i in assigned or i == layout.right_y:
-                continue
-            value = self._safe_axis(i)
-            if abs(abs(value) - 1.0) < 0.05:
-                continue
-            if abs(value) > abs(best_val) + 0.25:
-                best_idx, best_val = i, value
-        if best_idx != layout.right_y and abs(best_val) > 0.4:
-            logger.info(
-                "Remapping right stick Y (elbow_flex) from axis %s to axis %s",
-                layout.right_y,
-                best_idx,
-            )
-            self._layout = replace(layout, right_y=best_idx)
-            return best_val
-        return primary
+        sdl_ry = self._sdl_right_y()
+        if not duplicates_reference(sdl_ry, right_x):
+            candidates.append(("sdl_ry", sdl_ry))
+        if self._linux_js is not None:
+            linux_ry = self._linux_js.axis(layout.right_y)
+            candidates.append((f"linux_js{layout.right_y}", linux_ry))
+
+        if not self._dumped_live_axes and self.joystick is not None:
+            live = [self._safe_axis(i) for i in range(self.joystick.get_numaxes())]
+            if any(abs(v) > 0.5 for v in live) or abs(sdl_ry) > 0.5:
+                logger.info(
+                    "Live analog while deflected: js=%s sdl_ry=%.3f rx=%.3f candidates=%s",
+                    [round(v, 3) for v in live],
+                    sdl_ry,
+                    right_x,
+                    [(n, round(v, 3)) for n, v in candidates],
+                )
+                self._dumped_live_axes = True
+
+        name, value = pick_strongest_uncorrelated(candidates, right_x, self.deadzone)
+        if name and abs(value) > 0.35 and not self._ry_source_logged:
+            logger.info("elbow_flex / right stick Y source: %s (value=%.3f)", name, value)
+            self._ry_source_logged = True
+            if name.startswith("js"):
+                idx = int(name[2:])
+                if idx != layout.right_y:
+                    self._layout = replace(layout, right_y=idx)
+        if name:
+            return value
+        return self._safe_axis(layout.right_y)
+
+    def _analog_axis(self, index: int | None) -> float:
+        """Prefer the Linux js node when it is open; otherwise pygame."""
+        if self._linux_js is not None:
+            return self._linux_js.axis(index)
+        return self._safe_axis(index)
 
     def _safe_axis(self, index: int | None) -> float:
         if index is None or self.joystick is None or index >= self.joystick.get_numaxes():
@@ -905,10 +1093,33 @@ class GamepadController(InputController):
 
     def _update_from_joystick(self):
         layout = self._layout
-        left_x = self._track_stick_peak("left_x", self._safe_axis(layout.left_x))
-        left_y = self._track_stick_peak("left_y", self._safe_axis(layout.left_y))
-        right_x = self._track_stick_peak("right_x", self._safe_axis(layout.right_x))
-        right_y = self._track_stick_peak("right_y", self._read_right_y())
+        left_x = self._analog_axis(layout.left_x)
+        left_y = self._analog_axis(layout.left_y)
+        right_x = self._analog_axis(layout.right_x)
+        if self._linux_js is not None:
+            right_y = self._linux_js.axis(layout.right_y)
+            if abs(right_y) > 0.35 and not self._ry_source_logged:
+                logger.info(
+                    "elbow_flex / right stick Y source: %s axis %s (value=%.3f)",
+                    self._linux_js.path,
+                    layout.right_y,
+                    right_y,
+                )
+                self._ry_source_logged = True
+            if not self._dumped_live_axes and (abs(right_y) > 0.5 or abs(right_x) > 0.5):
+                pygame_live = (
+                    [round(self._safe_axis(i), 3) for i in range(self.joystick.get_numaxes())]
+                    if self.joystick
+                    else []
+                )
+                logger.info(
+                    "Live analog while deflected: linux_js=%s pygame=%s",
+                    {i: round(v, 3) for i, v in sorted(self._linux_js.axes.items())},
+                    pygame_live,
+                )
+                self._dumped_live_axes = True
+        else:
+            right_y = self._resolve_right_y(right_x)
         trigger_left = self._trigger_from_axis_or_button(layout.trigger_left, layout.button_l1)
         trigger_right = self._trigger_from_axis_or_button(layout.trigger_right, layout.button_r1)
         # Some pads expose L2/R2 only as buttons (indices often 6/7) when analog axes are missing.
@@ -936,7 +1147,7 @@ class GamepadController(InputController):
         )
 
     def _trigger_from_axis_or_button(self, axis_index: int | None, _button_index: int) -> float:
-        raw = self._safe_axis(axis_index)
+        raw = self._analog_axis(axis_index)
         # Analog triggers are usually 0..1 (SDL) or -1..1 (DirectInput, rest = -1).
         if raw < 0:
             return (raw + 1.0) / 2.0

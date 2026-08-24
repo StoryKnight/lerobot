@@ -6,19 +6,25 @@ import pytest
 
 from lerobot.teleoperators.gamepad.gamepad_utils import (
     DUALSENSE_JOYSTICK_LAYOUT,
+    JS_EVENT_AXIS,
     LINUX_DUALSENSE_JOYSTICK_LAYOUT,
     SONY_VENDOR_ID,
     XBOX_JOYSTICK_LAYOUT,
     InputController,
     apply_deadzone,
-    boost_weak_stick_axis,
     classify_hid_report,
+    classify_joystick_axes,
+    duplicates_reference,
     hid_device_is_gamepad,
     infer_dualsense_analog_layout,
+    is_linux_gamepad_js_name,
     layout_for_device_name,
+    parse_js_event,
     parse_logitech_report,
     parse_sony_hid_report,
     parse_xbox_gip_report,
+    pick_strongest_uncorrelated,
+    select_linux_js_device,
 )
 from lerobot.teleoperators.utils import TeleopEvents
 
@@ -100,16 +106,71 @@ class TestInferDualsenseAnalogLayout:
         assert infer_dualsense_analog_layout([0.0, 0.0, 0.0]) is None
 
 
-class TestBoostWeakStickAxis:
-    def test_boosts_compressed_right_y(self):
-        boosted = boost_weak_stick_axis(0.08, peak=0.08, reference_peak=0.95)
-        assert boosted == pytest.approx(0.95)
+class TestPickRightYAxis:
+    def test_classify_linux_rest(self):
+        sticks, triggers = classify_joystick_axes([0.0, 0.0, -1.0, 0.0, 0.0, -1.0])
+        assert sticks == [0, 1, 3, 4]
+        assert triggers == [2, 5]
 
-    def test_does_not_boost_healthy_axis(self):
-        assert boost_weak_stick_axis(0.9, peak=0.9, reference_peak=0.95) == pytest.approx(0.9)
+    def test_skips_duplicate_of_right_x(self):
+        name, value = pick_strongest_uncorrelated(
+            [("js4", 0.07), ("sdl_ry", 0.96)],
+            reference=0.97,
+            min_abs=0.1,
+        )
+        # sdl_ry is a copy of RX — ignore it, js4 is too small
+        assert name == ""
+        assert value == 0.0
 
-    def test_does_not_boost_without_reference(self):
-        assert boost_weak_stick_axis(0.08, peak=0.08, reference_peak=0.1) == pytest.approx(0.08)
+    def test_picks_full_range_uncorrelated_axis(self):
+        name, value = pick_strongest_uncorrelated(
+            [("js4", 0.07), ("js6", -0.99), ("sdl_ry", 0.96)],
+            reference=0.05,
+            min_abs=0.1,
+        )
+        assert name == "js6"
+        assert value == pytest.approx(-0.99)
+
+    def test_duplicates_reference(self):
+        assert duplicates_reference(0.95, 0.97) is True
+        assert duplicates_reference(-0.95, 0.97) is True
+        assert duplicates_reference(0.95, 0.05) is False
+
+
+def _js_event(value: int, number: int, ev_type: int = JS_EVENT_AXIS) -> bytes:
+    return struct.pack("=IhBB", 0, value, ev_type, number)
+
+
+class TestLinuxJoystickApi:
+    def test_axis_full_throw(self):
+        kind, number, value = parse_js_event(_js_event(32767, 4))
+        assert kind == JS_EVENT_AXIS
+        assert number == 4
+        assert value == pytest.approx(1.0)
+
+    def test_init_axis_is_still_axis(self):
+        kind, number, value = parse_js_event(_js_event(-32767, 4, ev_type=JS_EVENT_AXIS | 0x80))
+        assert kind == JS_EVENT_AXIS
+        assert number == 4
+        assert value == pytest.approx(-1.0, abs=0.001)
+
+    def test_skips_motion_sensor_name(self):
+        assert is_linux_gamepad_js_name("Sony Interactive Entertainment DualSense Wireless Controller")
+        assert not is_linux_gamepad_js_name(
+            "Sony Interactive Entertainment DualSense Wireless Controller Motion Sensors"
+        )
+
+    def test_selects_gamepad_not_motion_node(self):
+        devices = [
+            ("/dev/input/js0", "Sony Interactive Entertainment DualSense Wireless Controller Motion Sensors"),
+            ("/dev/input/js1", "Sony Interactive Entertainment DualSense Wireless Controller"),
+        ]
+        path = select_linux_js_device(
+            devices,
+            pygame_name="Sony Interactive Entertainment DualSense Wireless Controller",
+            device_name=None,
+        )
+        assert path == "/dev/input/js1"
 
 
 class TestApplyDeadzone:
